@@ -49,6 +49,35 @@ def _validate_token(value: str) -> str:
     return value
 
 
+def _validate_witness_config(
+    witnesses: Optional[list["WitnessInput"]],
+    witness_threshold: Optional[int],
+) -> None:
+    """见证配置校验：无见证人时阈值必须缺省；有见证人时 2～5 名、
+    阈值必填且在 1～见证人数量之间，名称与令牌均不得重复。"""
+    witnesses = witnesses or []
+    if not witnesses:
+        if witness_threshold is not None:
+            raise ValueError("无见证人时不能设置 witness_threshold")
+        return
+
+    if not (_WITNESS_MIN <= len(witnesses) <= _WITNESS_MAX):
+        raise ValueError(
+            f"见证人数量必须在 {_WITNESS_MIN}～{_WITNESS_MAX} 名之间"
+        )
+    if witness_threshold is None:
+        raise ValueError("见证邀约必须提供 witness_threshold")
+    if not (1 <= witness_threshold <= len(witnesses)):
+        raise ValueError("witness_threshold 必须在 1～见证人数量之间")
+
+    names = [w.name for w in witnesses]
+    if len(set(names)) != len(names):
+        raise ValueError("见证人名称不能重复")
+    tokens = [w.token for w in witnesses]
+    if len(set(tokens)) != len(tokens):
+        raise ValueError("见证人令牌不能重复")
+
+
 class CreateChainRequest(BaseModel):
     file_hash: str = Field(..., description="交接文件的 SHA-256 摘要（64 位十六进制）")
     first_holder: str = Field(..., description="首位持有人标识")
@@ -244,28 +273,7 @@ class OfferCreateRequest(BaseModel):
 
     @model_validator(mode="after")
     def _check_witnesses(self) -> "OfferCreateRequest":
-        witnesses = self.witnesses or []
-        if not witnesses:
-            # 无见证邀约：阈值必须缺省
-            if self.witness_threshold is not None:
-                raise ValueError("无见证人时不能设置 witness_threshold")
-            return self
-
-        if not (_WITNESS_MIN <= len(witnesses) <= _WITNESS_MAX):
-            raise ValueError(
-                f"见证人数量必须在 {_WITNESS_MIN}～{_WITNESS_MAX} 名之间"
-            )
-        if self.witness_threshold is None:
-            raise ValueError("见证邀约必须提供 witness_threshold")
-        if not (1 <= self.witness_threshold <= len(witnesses)):
-            raise ValueError("witness_threshold 必须在 1～见证人数量之间")
-
-        names = [w.name for w in witnesses]
-        if len(set(names)) != len(names):
-            raise ValueError("见证人名称不能重复")
-        tokens = [w.token for w in witnesses]
-        if len(set(tokens)) != len(tokens):
-            raise ValueError("见证人令牌不能重复")
+        _validate_witness_config(self.witnesses, self.witness_threshold)
         return self
 
 
@@ -286,7 +294,7 @@ class OfferOut(BaseModel):
         ...,
         description=(
             "邀约状态：pending / accepted / expired / rejected / "
-            "terminated / cancelled（后五者为终止或派生状态）"
+            "terminated / cancelled / replaced（后六者为终止或派生状态）"
         ),
     )
     expires_at: str
@@ -349,6 +357,102 @@ class OfferCancelResult(BaseModel):
     )
 
 
+class OfferReplaceRequest(BaseModel):
+    cancellation_code: str = Field(
+        ...,
+        description="原邀约的一次性撤销码（服务端只存其摘要，验码通过才可替换）",
+    )
+    receiver: str = Field(..., description="新邀约的接收方标识")
+    expires_in_seconds: int = Field(
+        ...,
+        description="新邀约有效期（秒），自替换时刻起算",
+        ge=1,
+        le=_OFFER_TTL_MAX,
+    )
+    confirmation_code: str = Field(
+        ..., description="新邀约的一次性确认码，服务端只保存其 SHA-256 摘要"
+    )
+    new_cancellation_code: Optional[str] = Field(
+        default=None,
+        description=(
+            "新邀约的可选一次性撤销码：提供后新邀约可凭此码撤销或再次替换，"
+            "服务端只保存「绑定新 offer_id 做域分隔」的 SHA-256 摘要；"
+            "省略则新邀约不可撤销、不可替换"
+        ),
+    )
+    witnesses: Optional[list[WitnessInput]] = Field(
+        default=None,
+        description=(
+            "新邀约的见证人列表（2～5 名，各持独立一次性令牌）；"
+            "省略或为空则新邀约为无见证邀约，与原邀约是否有见证人无关"
+        ),
+    )
+    witness_threshold: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "新邀约的见证通过阈值：提供见证人时必填，合法范围 1～见证人数量"
+        ),
+    )
+
+    @field_validator("cancellation_code")
+    @classmethod
+    def _check_cancellation_code(cls, v: str) -> str:
+        return _validate_code(v, "cancellation_code")
+
+    @field_validator("receiver")
+    @classmethod
+    def _check_receiver(cls, v: str) -> str:
+        return _validate_name(v, "receiver")
+
+    @field_validator("confirmation_code")
+    @classmethod
+    def _check_confirmation_code(cls, v: str) -> str:
+        return _validate_code(v)
+
+    @field_validator("new_cancellation_code")
+    @classmethod
+    def _check_new_cancellation_code(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        code = _validate_code(v, "new_cancellation_code")
+        return code or None
+
+    @model_validator(mode="after")
+    def _check_witnesses(self) -> "OfferReplaceRequest":
+        _validate_witness_config(self.witnesses, self.witness_threshold)
+        return self
+
+
+class OfferReplaceResult(BaseModel):
+    offer_id: str = Field(..., description="替换产生的新邀约 ID")
+    chain_id: str
+    receiver: str = Field(..., description="新邀约的接收方")
+    status: Literal["pending"] = Field(
+        "pending", description="新邀约状态固定为 pending"
+    )
+    expires_at: str = Field(..., description="新邀约有效期截止时刻（UTC ISO-8601）")
+    created_at: str = Field(..., description="新邀约创建时刻（UTC ISO-8601）")
+    tail_hash: str = Field(
+        ..., description="新邀约锁定的链尾哈希，与被替换的原邀约相同"
+    )
+    replaces: str = Field(
+        ..., description="被替换的原邀约 ID；原邀约状态已置为 replaced"
+    )
+    cancellable: bool = Field(
+        ...,
+        description="新邀约是否可凭撤销码撤销/再次替换（是否提供了新撤销码）",
+    )
+    witness_mode: bool = Field(..., description="新邀约是否见证确认模式")
+    witness_threshold: Optional[int] = Field(
+        None, description="新邀约的见证通过阈值；无见证邀约为 null"
+    )
+    witnesses: list[WitnessCreatedOut] = Field(
+        default_factory=list,
+        description="新邀约的见证人及其一次性令牌明文（仅此一次返回）",
+    )
+
+
 class WitnessStateOut(BaseModel):
     witness_index: int
     name: str
@@ -367,7 +471,8 @@ class OfferStatusOut(BaseModel):
         description=(
             "pending（待确认）/ accepted（已确认）/ expired（已过期，派生）/ "
             "rejected（见证模式下有见证人拒绝，派生）/ "
-            "terminated（链尾已推进，派生）/ cancelled（已撤销，存储状态）"
+            "terminated（链尾已推进，派生）/ cancelled（已撤销，存储状态）/ "
+            "replaced（已被替换，存储状态）"
         ),
     )
     expires_at: str
@@ -379,11 +484,22 @@ class OfferStatusOut(BaseModel):
     cancellable: bool = Field(
         default=False,
         description=(
-            "是否可凭撤销码取消；旧邀约（无撤销码）恒为 false，"
+            "是否可凭撤销码取消/替换；旧邀约（无撤销码）恒为 false，"
             "响应不含撤销码及其摘要"
         ),
     )
     cancelled_at: Optional[str] = Field(None, description="撤销时刻；未撤销为 null")
+    replaced_at: Optional[str] = Field(
+        None, description="被替换时刻；未被替换为 null"
+    )
+    replaces: Optional[str] = Field(
+        None,
+        description="本邀约替换掉的原邀约 ID；非替换产生的邀约为 null",
+    )
+    replaced_by: Optional[str] = Field(
+        None,
+        description="替换本邀约的新邀约 ID；仅 status 为 replaced 时有值",
+    )
     witness_mode: bool = False
     witness_threshold: Optional[int] = Field(
         None, description="见证通过阈值；无见证邀约为 null"
@@ -409,7 +525,7 @@ class WitnessStatusOut(BaseModel):
         ...,
         description=(
             "邀约派生状态：pending / accepted / expired / rejected / "
-            "terminated / cancelled"
+            "terminated / cancelled / replaced"
         ),
     )
     witness_threshold: int = Field(..., description="通过所需同意数")

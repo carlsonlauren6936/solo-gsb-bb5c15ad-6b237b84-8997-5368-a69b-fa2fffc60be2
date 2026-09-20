@@ -34,25 +34,42 @@
      （与历史版本完全兼容）。
   2. **确认邀约** `POST /offers/{offer_id}/confirm`：接收方凭 `offer_id` 与
      确认码确认。服务端在**同一个 SQLite 立即事务**中依次校验「确认码摘要匹配 →
-     邀约未过期 → 邀约未使用 → 邀约未撤销 → 链尾仍匹配」，全部通过后追加唯一
+     邀约未过期 → 邀约未使用 → 邀约未撤销/未替换 → 链尾仍匹配」，全部通过后追加唯一
      移交事件（`nonce` 取 `offer:<offer_id>`，天然一次性）并将邀约置为
      `accepted`，整体原子提交。**过期（`offer_expired`）、重复确认
      （`offer_already_accepted`）、链尾已推进（`tail_mismatch`）、邀约已撤销
-     （`offer_not_cancellable`）均返回 409 且不写任何事件**；
-     确认码错误返回 **403**（`code_mismatch`）。
+     （`offer_not_cancellable`）、邀约已替换（`offer_replaced`）均返回 409
+     且不写任何事件**；确认码错误返回 **403**（`code_mismatch`）。
   3. **撤销邀约** `POST /offers/{offer_id}/cancel`（仅创建时提供了
-     `cancellation_code` 的邀约可用）：发起方凭撤销码撤销。撤销、接收方确认与
-     见证人表态在**同一个 SQLite 立即事务层面互斥**，竞争终态中至多一个成功。
-     仅当邀约**仍 `pending` 且链尾未推进、未过期、无见证人拒绝**时可撤销，
+     `cancellation_code` 的邀约可用）：发起方凭撤销码撤销。撤销、接收方确认、
+     替换与见证人表态在**同一个 SQLite 立即事务层面互斥**，竞争终态中至多一个
+     成功。仅当邀约**仍 `pending` 且链尾未推进、未过期、无见证人拒绝**时可撤销，
      撤销只把邀约置为 `cancelled`，**绝不追加或修改任何哈希链事件**；撤销码
      错误返回 **403**（`cancel_code_mismatch`）。
-  4. **不可撤销的情形**：邀约已 `accepted`、`rejected`、`expired`、
-     `terminated`、`cancelled`，或创建时未提供撤销码（含全部旧邀约），
-     调用撤销一律返回 **409**（`offer_not_cancellable`）且不改写链。
-  5. **查询邀约** `GET /offers/{offer_id}`：返回邀约状态
+  4. **替换邀约** `POST /offers/{offer_id}/replace`（同样仅创建时提供了
+     `cancellation_code` 的邀约可用）：发起方凭**原撤销码**提交**新的接收方、
+     有效期、确认码**，可选**新撤销码**与**新的见证配置**（2～5 名见证人及
+     阈值，与原邀约是否有见证人无关）。服务端在**同一个 SQLite 立即事务**中
+     确认原邀约**仍 `pending`、未过期、链尾未推进且无见证人拒绝**，随后将
+     原邀约置为 `replaced` 并创建**锁定同一链尾**的新邀约，整体原子提交：
+     与确认、撤销、见证表态互斥，竞争中至多一个终态成功；任一校验失败整体
+     回滚，**不产生半替换**（不会只改旧邀约或只建新邀约）。原撤销码错误返回
+     **403**（`cancel_code_mismatch`）；原邀约已 `accepted` / `rejected` /
+     `expired` / `terminated` / `cancelled` / `replaced`，或创建时未提供
+     撤销码，均返回 **409**（`offer_not_replaceable`）。新邀约的全部凭证
+     （确认码、撤销码、见证令牌）重新生成，摘要域绑定**新** `offer_id`，
+     **原邀约的一切凭证对新邀约无效**；替换同样**不追加任何链上事件**。
+  5. **不可撤销/不可替换的情形**：邀约已 `accepted`、`rejected`、`expired`、
+     `terminated`、`cancelled`、`replaced`，或创建时未提供撤销码（含全部
+     旧邀约），调用撤销/替换一律返回 **409**（`offer_not_cancellable` /
+     `offer_not_replaceable`）且不改写链。对已 `replaced` 邀约确认或表态
+     返回 **409**（`offer_replaced`）。
+  6. **查询邀约** `GET /offers/{offer_id}`：返回邀约状态
      （`pending` / `accepted` / `expired` / `terminated` / `rejected` /
-     `cancelled`，其中过期、终止、拒绝为派生状态）、`cancellable` 标记、
-     `cancelled_at` 与确认结果，**不含确认码、撤销码及其摘要**。
+     `cancelled` / `replaced`，其中过期、终止、拒绝为派生状态）、
+     `cancellable` 标记、`cancelled_at` / `replaced_at`、确认结果与**替换
+     关系**（`replaces` 为本邀约替换掉的原邀约 ID，`replaced_by` 为替换本
+     邀约的新邀约 ID），**不含确认码、撤销码、令牌及其摘要**。
 - **见证确认（可选模式）**：发起邀约时可附带 2～5 名见证人及通过阈值
   `witness_threshold`（1～见证人数量），其余流程与普通邀约一致：
   1. 发起邀约时每个见证人提交 `name` 与一个**互相独立的一次性令牌** `token`。
@@ -119,9 +136,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/offers` | 发起邀约（链尾 + 接收方 + 有效期 + 一次性确认码；可选撤销码；可选 2～5 名见证人与阈值） |
 | `POST` | `/offers/{offer_id}/confirm` | 接收方凭确认码确认，原子追加移交事件（见证模式须无拒绝且同意数达阈值） |
 | `POST` | `/offers/{offer_id}/cancel` | 凭一次性撤销码撤销邀约（仅 pending 且链尾未推进/未过期/无拒绝；错码 403，终态或无撤销码 409；不改链） |
+| `POST` | `/offers/{offer_id}/replace` | 凭原撤销码原子替换邀约：原邀约置为 replaced 并创建锁定同一链尾的新邀约（新接收方/有效期/确认码，可选新撤销码与见证配置；错码 403，非可替换状态 409；不产生半替换） |
 | `POST` | `/offers/{offer_id}/witness-decisions` | 见证人凭独立一次性令牌表态同意 / 拒绝（每人至多一次） |
 | `GET`  | `/offers/{offer_id}/witnesses` | 查询见证表态状态与计数（不含令牌摘要；无见证邀约 404） |
-| `GET`  | `/offers/{offer_id}` | 查询单个邀约状态（pending / accepted / expired / rejected / terminated / cancelled） |
+| `GET`  | `/offers/{offer_id}` | 查询单个邀约状态（pending / accepted / expired / rejected / terminated / cancelled / replaced）与替换关系 replaces / replaced_by |
 | `GET`  | `/chains` | 列出全部链条 |
 | `GET`  | `/chains/{chain_id}` | 查询链条与全部事件 |
 | `GET`  | `/chains/{chain_id}/verify` | 完整性校验，指出首个断裂序号 |
@@ -136,10 +154,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 `witness_already_decided`（见证人已表态，令牌不可重复使用）、
 `offer_not_witnessed`（对无见证邀约调用表态接口）、
 `offer_not_cancellable`（邀约不可撤销：已 accepted / rejected / expired /
-terminated / cancelled，或创建时未提供撤销码的旧邀约；撤销与确认/表态竞争
-落败也返回此码）；
+terminated / cancelled / replaced，或创建时未提供撤销码的旧邀约；撤销与
+确认/表态/替换竞争落败也返回此码）、
+`offer_not_replaceable`（邀约不可替换：已 accepted / rejected / expired /
+terminated / cancelled / replaced，或创建时未提供撤销码；替换与确认/撤销/
+表态竞争落败也返回此码）、
+`offer_replaced`（对已替换的邀约确认或表态）；
 **403** —— `code_mismatch`（确认码错误）、`token_mismatch`（见证人令牌错误）、
-`cancel_code_mismatch`（撤销码错误）；
+`cancel_code_mismatch`（撤销/替换时撤销码错误）；
 **404** —— 链条、邀约不存在，或对无见证邀约查询 `witness_mode_not_found`。
 
 ## 使用示例
@@ -241,6 +263,56 @@ curl -s http://localhost:8000/offers/5b8d...
 # {"status":"cancelled","cancellable":true,"cancelled_at":"...", ...}
 ```
 
+### 替换邀约示例
+
+```bash
+# 1) alice 发起「可撤销」邀约（提供 cancellation_code 才可替换）
+curl -s -X POST http://localhost:8000/offers \
+  -H 'Content-Type: application/json' \
+  -d '{"chain_id":"ab12...","tail_hash":"<当前链尾>","receiver":"bob",
+       "expires_in_seconds":3600,"confirmation_code":"s3cret",
+       "cancellation_code":"v0uch-99"}'
+# {"offer_id":"5b8d...","status":"pending","cancellable":true, ...}
+
+# 2) bob 确认之前，alice 凭原撤销码把邀约改派给 carol：
+#    新接收方、新有效期、新确认码，可选新撤销码（省略则新邀约不可撤销/替换），
+#    也可同时提交 2～5 名见证人与阈值（witnesses + witness_threshold）
+curl -s -X POST http://localhost:8000/offers/5b8d.../replace \
+  -H 'Content-Type: application/json' \
+  -d '{"cancellation_code":"v0uch-99","receiver":"carol",
+       "expires_in_seconds":7200,"confirmation_code":"nu3-code",
+       "new_cancellation_code":"v0uch-100"}'
+# 201 {"offer_id":"8f2a...","status":"pending","replaces":"5b8d...",
+#      "tail_hash":"<与原邀约相同的链尾>","cancellable":true, ...}
+# 同一事务内：原邀约 5b8d... 已置为 replaced，新邀约 8f2a... 锁定同一链尾
+
+# 3) 详情接口查看替换关系（不含任何凭证摘要）
+curl -s http://localhost:8000/offers/5b8d...
+# {"status":"replaced","replaced_by":"8f2a...","replaces":null,
+#  "replaced_at":"2026-...", ...}
+curl -s http://localhost:8000/offers/8f2a...
+# {"status":"pending","replaces":"5b8d...","replaced_by":null, ...}
+
+# 4) 原邀约的一切凭证对新邀约无效：旧确认码确认新邀约 → 403 code_mismatch；
+#    对已 replaced 的原邀约确认/表态 → 409 offer_replaced；
+#    再撤销/再替换原邀约 → 409
+curl -i -X POST http://localhost:8000/offers/5b8d.../confirm \
+  -H 'Content-Type: application/json' -d '{"confirmation_code":"s3cret"}'
+
+# 5) 替换时撤销码错误 → 403 cancel_code_mismatch；
+#    邀约已 accepted/rejected/expired/terminated/cancelled/replaced，
+#    或创建时未提供撤销码 → 409 offer_not_replaceable；
+#    任一失败都整体回滚：原邀约状态不变，也不会留下新建邀约
+curl -i -X POST http://localhost:8000/offers/8f2a.../replace \
+  -H 'Content-Type: application/json' \
+  -d '{"cancellation_code":"wrong","receiver":"dave",
+       "expires_in_seconds":60,"confirmation_code":"x"}'
+
+# 6) carol 凭新确认码确认新邀约 → 原子追加移交事件
+curl -s -X POST http://localhost:8000/offers/8f2a.../confirm \
+  -H 'Content-Type: application/json' -d '{"confirmation_code":"nu3-code"}'
+```
+
 ### 见证确认示例
 
 ```bash
@@ -312,16 +384,20 @@ curl -s http://localhost:8000/offers/9d1a.../witnesses
    「读链尾 → 比对 → 插入 → 推进」是一个原子步骤。邀约确认同样如此：
    「验码 → 未过期 → 未使用 → 未撤销 → 链尾匹配 → （见证模式）无拒绝且同意数
    达阈值 → 追加事件 → 置 accepted」全部在同一立即事务内，任一校验失败即整体
-   回滚。**邀约撤销、接收方确认与见证人表态共用同一把写锁与同一立即事务语义，
-   三者互斥**：撤销的「验撤销码 → 仍 pending → 未过期 → 链尾未推进 → 无拒绝 →
-   置 cancelled（且不追加任何链上事件）」整体原子，竞争终态（accepted /
-   cancelled / rejected）中最多一个成功，撤销成功后哈希链完全不变。
+   回滚。**邀约撤销、替换、接收方确认与见证人表态共用同一把写锁与同一立即事务
+   语义，四者互斥**：撤销的「验撤销码 → 仍 pending → 未过期 → 链尾未推进 →
+   无拒绝 → 置 cancelled（且不追加任何链上事件）」整体原子；替换的「验原撤销
+   码 → 仍 pending → 未过期 → 链尾未推进 → 无拒绝 → 创建锁定同一链尾的新邀约
+   → 原邀约置 replaced 并指向新邀约」同样整体原子，竞争终态（accepted /
+   cancelled / replaced / rejected）中最多一个成功，失败整体回滚、不产生
+   半替换，撤销与替换成功后哈希链完全不变。
    见证人表态的「按令牌摘要定位见证人 → 查未表态 → 写入 decision」也在同一
    立即事务内串行完成，同一令牌并发表态最多一次成功。
 2. 数据库层设有 `UNIQUE(chain_id, seq)` 与 `UNIQUE(chain_id, nonce)` 唯一约束
    作为兜底，任何竞争写入都无法产生重号事件或重放随机数；邀约确认使用
-   派生随机数 `offer:<offer_id>`，同一邀约并发确认最多成功一次。撤销则以
-   `UPDATE ... WHERE status='pending'` 的影响行数兜底，竞争落败即回滚返回 409。
+   派生随机数 `offer:<offer_id>`，同一邀约并发确认最多成功一次。撤销与替换
+   则以 `UPDATE ... WHERE status='pending'` 的影响行数兜底，竞争落败即回滚
+   返回 409（替换回滚时新邀约插入一并撤销）。
    见证人表设有 `UNIQUE(offer_id, witness_index)` 与
    `UNIQUE(offer_id, token_digest)`，且表态以「行已存在 decision」判定一次性，
    重复使用令牌不可能产生第二条表态。
@@ -329,8 +405,10 @@ curl -s http://localhost:8000/offers/9d1a.../witnesses
 4. 数据库初始化（`init_db`）全部使用 `CREATE ... IF NOT EXISTS`，可重复执行；
    对已有数据文件只做增量补表（含 `offers`、`offer_witnesses` 表）；对旧版
    `offers` 表按 SQLite 官方「建新表 → 搬数据 → 改名」流程一次性就地重建，
-   增补 `witness_threshold`（旧无见证邀约为 NULL）与 `cancel_code_digest` /
-   `cancelled_at`（旧邀约撤销码为 NULL，即不可撤销），存量邀约与事件不受影响。
+   增补 `witness_threshold`（旧无见证邀约为 NULL）、`cancel_code_digest` /
+   `cancelled_at`（旧邀约撤销码为 NULL，即不可撤销、不可替换）与
+   `replaced_at` / `replaced_by`（旧邀约无替换关系，为 NULL），存量邀约与
+   事件不受影响。
 
 ## 项目结构
 
@@ -338,7 +416,7 @@ curl -s http://localhost:8000/offers/9d1a.../witnesses
 .
 ├── app/
 │   ├── main.py        # FastAPI 路由与启动
-│   ├── service.py     # 哈希链核心逻辑（创建 / 追加 / 邀约确认 / 撤销 / 见证 / 查询 / 校验）
+│   ├── service.py     # 哈希链核心逻辑（创建 / 追加 / 邀约确认 / 撤销 / 替换 / 见证 / 查询 / 校验）
 │   ├── database.py    # SQLite 连接、建表与旧 offers 表重建迁移、串行写事务
 │   ├── hashing.py     # 紧凑 JSON 规范与 SHA-256
 │   ├── schemas.py     # Pydantic 请求/响应模型
