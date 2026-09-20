@@ -20,6 +20,7 @@ from .schemas import (
     OfferConfirmResult,
     OfferCreateRequest,
     OfferOut,
+    OfferReplaceRequest,
     OfferStatusOut,
     VerifyResult,
     WitnessDecisionRequest,
@@ -38,6 +39,7 @@ from .service import (
     get_witness_status,
     list_chains,
     record_witness_decision,
+    replace_offer,
     verify_chain,
 )
 
@@ -52,7 +54,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="文件交接留痕服务",
     description="基于 SHA-256 哈希链的多人文件交接记录、查询与完整性校验。",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -109,8 +111,9 @@ def api_handover(req: HandoverRequest) -> HandoverResult:
         "以最新链尾 tail_hash 锁定邀约，指定 receiver、有效期（秒）与一次性确认码。"
         "服务端只保存确认码的 SHA-256 摘要，返回 offer_id 供接收方确认。"
         "可选提交 cancellation_code：服务端仅保存绑定 offer_id 做域分隔的 SHA-256 "
-        "撤销码摘要，此后可凭码调用 POST /offers/{offer_id}/cancel 撤销；省略则"
-        "创建不可撤销的兼容旧行为邀约。"
+        "撤销码摘要，此后可凭码调用 POST /offers/{offer_id}/cancel 撤销或调用 "
+        "POST /offers/{offer_id}/replace 原子替换；省略则创建不可撤销/不可替换"
+        "的兼容旧行为邀约。"
         "可选提交 2～5 名见证人及通过阈值 witness_threshold：每位见证人获得一个"
         "独立一次性令牌（仅在本响应中明文返回一次，服务端只存其 SHA-256 摘要）。"
     ),
@@ -145,7 +148,7 @@ def api_create_offer(req: OfferCreateRequest) -> OfferOut:
         "接收方凭 offer_id 与一次性确认码确认。服务端在同一 SQLite 立即事务中校验"
         "邀约未过期、未使用、未撤销且链尾仍匹配；见证模式下还须无见证人拒绝且同意数达到"
         "阈值，然后才追加唯一移交事件并将邀约置为 accepted。过期、重复确认、"
-        "见证拒绝、同意数不足、链尾已推进或邀约已撤销均返回 409，不写事件。"
+        "见证拒绝、同意数不足、链尾已推进、邀约已撤销或已被替换均返回 409，不写事件。"
     ),
 )
 def api_confirm_offer(offer_id: str, req: OfferConfirmRequest) -> OfferConfirmResult:
@@ -162,13 +165,54 @@ def api_confirm_offer(offer_id: str, req: OfferConfirmRequest) -> OfferConfirmRe
         "同一 SQLite 立即事务中与接收方确认、见证人表态互斥地校验：邀约仍 pending、"
         "链尾未推进、未过期且无见证人拒绝，然后才将邀约置为 cancelled，绝不追加任何"
         "链上事件。撤销码错误返回 403 cancel_code_mismatch；邀约已 accepted、"
-        "rejected、expired、terminated、cancelled，或创建时未提供撤销码（旧邀约），"
-        "均返回 409 offer_not_cancellable 且不改写链。详情与见证查询会返回 "
-        "cancelled 状态，但绝不返回撤销码摘要。"
+        "rejected、expired、terminated、cancelled、replaced，或创建时未提供撤销码"
+        "（旧邀约），均返回 409 offer_not_cancellable 且不改写链。详情与见证查询会"
+        "返回 cancelled 状态，但绝不返回撤销码摘要。"
     ),
 )
 def api_cancel_offer(offer_id: str, req: OfferCancelRequest) -> OfferCancelResult:
     return OfferCancelResult(**cancel_offer(offer_id, req.cancellation_code))
+
+
+@app.post(
+    "/offers/{offer_id}/replace",
+    response_model=OfferOut,
+    status_code=201,
+    tags=["offers"],
+    summary="凭原撤销码原子替换待处理邀约",
+    description=(
+        "发起方凭原邀约创建时提供的撤销码提交新邀约参数：新的 receiver、"
+        "有效期 expires_in_seconds、一次性确认码 confirmation_code，以及可选的"
+        "新撤销码 new_cancellation_code 与可选的全新见证配置（2～5 名见证人 + "
+        "阈值）。服务端在同一个 SQLite 立即事务中依次确认原邀约仍 pending、"
+        "未过期、锁定链尾未推进且无见证人拒绝、原撤销码摘要匹配，然后才将原"
+        "邀约标记为 replaced 并创建锁定同一链尾的新邀约（replaces 指向原邀约）；"
+        "任一校验失败整体回滚，绝不产生半替换。替换与确认、撤销、见证人表态"
+        "互斥，竞争终态中至多一个成功。原撤销码错误返回 403 cancel_code_mismatch；"
+        "非可替换状态（accepted / cancelled / replaced / expired / terminated / "
+        "rejected，或原邀约创建时未提供撤销码）返回 409 offer_not_replaceable。"
+        "新邀约的确认码/撤销码/见证令牌全部重新生成与旧凭证互不通用；响应与"
+        "详情接口只暴露 replaces/replaced_by 关系，不泄露任何凭证摘要。"
+    ),
+)
+def api_replace_offer(offer_id: str, req: OfferReplaceRequest) -> OfferOut:
+    witnesses = (
+        [{"name": w.name, "token": w.token} for w in req.witnesses]
+        if req.witnesses
+        else None
+    )
+    return OfferOut(
+        **replace_offer(
+            offer_id,
+            req.cancellation_code,
+            req.receiver,
+            req.expires_in_seconds,
+            req.confirmation_code,
+            new_cancellation_code=req.new_cancellation_code,
+            witnesses=witnesses,
+            witness_threshold=req.witness_threshold,
+        )
+    )
 
 
 @app.post(
@@ -180,8 +224,8 @@ def api_cancel_offer(offer_id: str, req: OfferCancelRequest) -> OfferCancelResul
     description=(
         "见证模式邀约的见证人凭创建时分发的独立一次性令牌表态 approved 或 rejected。"
         "服务端只保存令牌摘要，同一见证人至多表态一次（重复使用令牌返回 409，"
-        "令牌错误返回 403）。任一拒绝使邀约终止；邀约过期、被撤销或链尾推进后表态"
-        "返回 409。响应不含令牌摘要。"
+        "令牌错误返回 403）。任一拒绝使邀约终止；邀约过期、被撤销、被替换或链尾"
+        "推进后表态返回 409。响应不含令牌摘要。"
     ),
 )
 def api_witness_decision(
@@ -213,8 +257,10 @@ def api_get_witness_status(offer_id: str) -> WitnessStatusOut:
     summary="查询单个邀约状态",
     description=(
         "返回邀约状态（pending / accepted / expired / rejected / terminated / "
-        "cancelled，后四者为派生或撤销存储状态）与确认/见证结果，不含确认码、"
-        "撤销码、令牌及其摘要；cancellable 仅表示该邀约创建时是否提供过撤销码。"
+        "cancelled / replaced，后五者为派生或存储终态）、确认/见证结果与"
+        "replaces / replaced_by 替换关系（各自只给 offer_id，可据此串联替换链），"
+        "不含确认码、撤销码、令牌及其任何摘要；cancellable 仅表示该邀约创建时"
+        "是否提供过撤销码。"
     ),
 )
 def api_get_offer(offer_id: str) -> OfferStatusOut:

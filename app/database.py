@@ -9,8 +9,13 @@
   witness_threshold 为 NULL 表示无见证邀约（兼容存量数据），否则为通过阈值。
   cancel_code_digest 为可选撤销码的 SHA-256 摘要（绑定 offer_id 做域分隔），
   为 NULL 表示该邀约创建时未提供撤销码、不可撤销（兼容存量邀约）；
-  status 取值 pending / accepted / cancelled（rejected / expired / terminated
-  为派生状态，不额外改写邀约行），cancelled_at 记录撤销时刻。
+  status 取值 pending / accepted / cancelled / replaced（rejected / expired /
+  terminated 为派生状态，不额外改写邀约行），cancelled_at 记录撤销时刻。
+  replaces 指向被本邀约原子替换掉的旧邀约（由替换产生的新邀约行非空），
+  replaced_by 指向替换本邀约而产生的新邀约（被替换的旧邀约行非空）；链式
+  替换（A→B→C）时中间邀约两列同时非空，replaced_at 记录替换时刻。替换与
+  确认/撤销/见证表态共用同一立即事务，竞争终态中至多一个成功，绝不产生
+  半替换。
 - offer_witnesses：见证邀约的见证人。只保存一次性令牌的 SHA-256 摘要
   （token_digest，与 offer_id 做域分隔），不存明文；decision 为 NULL 表示
   尚未表态，同一见证人至多表态一次（令牌本身即一次性）。拒绝/过期/链尾推进
@@ -52,9 +57,18 @@ _OFFERS_COLUMNS = """
     accepted_seq        INTEGER,
     cancel_code_digest  TEXT,
     cancelled_at        TEXT,
-    CHECK(status IN ('pending', 'accepted', 'cancelled')),
+    replaces            TEXT,
+    replaced_by         TEXT,
+    replaced_at         TEXT,
+    CHECK(status IN ('pending', 'accepted', 'cancelled', 'replaced')),
     CHECK(witness_threshold IS NULL OR witness_threshold >= 1),
-    FOREIGN KEY(chain_id) REFERENCES chains(chain_id)
+    -- replaced_by 与 replaced_at 成对出现：仅当邀约被原子替换时同时写入
+    CHECK((replaced_by IS NULL) = (replaced_at IS NULL)),
+    -- 进入 replaced 存储状态的邀约必须指向替换它的新邀约
+    CHECK(status <> 'replaced' OR replaced_by IS NOT NULL),
+    FOREIGN KEY(chain_id) REFERENCES chains(chain_id),
+    FOREIGN KEY(replaces) REFERENCES offers(offer_id),
+    FOREIGN KEY(replaced_by) REFERENCES offers(offer_id)
 """
 
 _SCHEMA = f"""
@@ -93,6 +107,9 @@ CREATE TABLE IF NOT EXISTS offers (
 CREATE INDEX IF NOT EXISTS idx_offers_chain
     ON offers(chain_id);
 
+-- idx_offers_replaces 在 init_db 的迁移检查之后创建：旧版 offers 表尚无
+-- replaces 列，直接在此建索引会失败；迁移完成（或确认无需迁移）后补建。
+
 CREATE TABLE IF NOT EXISTS offer_witnesses (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     offer_id        TEXT NOT NULL,
@@ -111,11 +128,12 @@ CREATE INDEX IF NOT EXISTS idx_offer_witnesses_offer
     ON offer_witnesses(offer_id, witness_index);
 """
 
-# 旧表重建时从旧表搬运的列（按新表列序），witness_threshold 缺失时补 NULL
-_LEGACY_COPY_COLUMNS = (
-    "offer_id, chain_id, tail_hash, receiver, code_digest, "
-    "{witness_threshold}, status, expires_at, created_at, "
-    "accepted_at, accepted_seq"
+# 旧表重建时必须具备的列；缺失列在搬数据时补 NULL（见 _migrate_offers_if_needed）
+_OFFERS_REQUIRED_COLUMNS = (
+    "offer_id", "chain_id", "tail_hash", "receiver", "code_digest",
+    "witness_threshold", "status", "expires_at", "created_at",
+    "accepted_at", "accepted_seq", "cancel_code_digest", "cancelled_at",
+    "replaces", "replaced_by", "replaced_at",
 )
 
 
@@ -143,14 +161,16 @@ def _get_conn() -> Iterator[sqlite3.Connection]:
 
 
 def _migrate_offers_if_needed(conn: sqlite3.Connection) -> None:
-    """把旧版 offers 表就地重建为含撤销列的新结构，存量行原样保留。
+    """把旧版 offers 表就地重建为最新结构，存量行原样保留。
 
     SQLite 无法直接 ALTER 修改 CHECK 约束 / 追加 NOT NULL 列，故采用官方
-    推荐的「建新表 -> 搬数据 -> 删旧表 -> 改名」流程，全程关闭外键约束：
+    推荐的「建新表 -> 搬数据 -> 删旧表 -> 改名」流程，全程关闭外键约束。
+    逐列判断旧表是否拥有该列，缺失列在搬数据时补 NULL：
     - 缺少 witness_threshold 的更早期版本：该列补 NULL（无见证邀约）；
-    - cancel_code_digest / cancelled_at 一律补 NULL：旧邀约没有撤销码，
-      因而不可撤销，行为与升级前完全一致。
-    全新数据库（offers 已按 _SCHEMA 建出）无需重建。
+    - cancel_code_digest / cancelled_at 缺失：补 NULL（旧邀约不可撤销）；
+    - replaces / replaced_by / replaced_at 缺失：补 NULL（旧邀约之间没有
+      替换关系，也不与新邀约的替换链发生外键关联）。
+    全新数据库（offers 已按 _SCHEMA 建出且列齐全）无需重建。
     """
     offer_cols = {
         row["name"]
@@ -158,14 +178,12 @@ def _migrate_offers_if_needed(conn: sqlite3.Connection) -> None:
     }
     if not offer_cols:
         return
-    if "cancel_code_digest" in offer_cols and "cancelled_at" in offer_cols:
+    if all(col in offer_cols for col in _OFFERS_REQUIRED_COLUMNS):
         return
 
-    witness_threshold_col = (
-        "witness_threshold" if "witness_threshold" in offer_cols else "NULL"
-    )
-    copy_columns = _LEGACY_COPY_COLUMNS.format(
-        witness_threshold=witness_threshold_col
+    select_list = ", ".join(
+        name if name in offer_cols else f"NULL AS {name}"
+        for name in _OFFERS_REQUIRED_COLUMNS
     )
     # 关闭/开启外键须在事务外；按 SQLite 官方「重建表」流程显式包一层
     # BEGIN ... COMMIT。新表先以临时名创建、删旧表后再改名：
@@ -178,14 +196,13 @@ def _migrate_offers_if_needed(conn: sqlite3.Connection) -> None:
 {_OFFERS_COLUMNS}
         );
         INSERT INTO offers__new
-            (offer_id, chain_id, tail_hash, receiver, code_digest,
-             witness_threshold, status, expires_at, created_at,
-             accepted_at, accepted_seq, cancel_code_digest, cancelled_at)
-        SELECT {copy_columns}, NULL, NULL
+            ({", ".join(_OFFERS_REQUIRED_COLUMNS)})
+        SELECT {select_list}
         FROM offers;
         DROP TABLE offers;
         ALTER TABLE offers__new RENAME TO offers;
         CREATE INDEX IF NOT EXISTS idx_offers_chain ON offers(chain_id);
+        CREATE INDEX IF NOT EXISTS idx_offers_replaces ON offers(replaces);
         COMMIT;
         PRAGMA foreign_keys = ON;
         """
@@ -201,14 +218,19 @@ def init_db() -> None:
     """初始化（或校验）数据库结构。可重复执行。
 
     对更早版本创建的 offers 表做一次性就地重建：增补 witness_threshold
-    （无见证旧邀约为 NULL）与 cancel_code_digest / cancelled_at
-    （旧邀约撤销码为 NULL，即不可撤销），并把 status 的 CHECK 扩展为
-    pending / accepted / cancelled；存量邀约数据原样搬运，行为兼容。
+    （无见证旧邀约为 NULL）、cancel_code_digest / cancelled_at（旧邀约
+    撤销码为 NULL，即不可撤销）以及 replaces / replaced_by / replaced_at
+    （旧邀约之间无替换关系），并把 status 的 CHECK 扩展为 pending /
+    accepted / cancelled / replaced；存量邀约数据原样搬运，行为兼容。
     """
     config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _get_conn() as conn:
         conn.executescript(_SCHEMA)
         _migrate_offers_if_needed(conn)
+        # 此刻 offers 必为最新结构（全新建表或刚完成旧表重建），补建替换列索引。
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_offers_replaces ON offers(replaces)"
+        )
 
 
 @contextmanager
